@@ -1,0 +1,35 @@
+@{
+    ViewData["Title"] = "Database Monitor";
+}
+
+<div class="container">
+    <h2>Database Monitor</h2>
+    <div id="messagesList" class="list-unstyled"></div>
+    <div class="table-responsive">
+        <table id="dataTable" class="table table-striped">
+            <thead>
+                <tr>
+                    <th>ChargingID</th>
+                    <th>SiteID</th>
+                    <th>ReceivedTime</th>
+                    <th>Datatime</th>
+                    <th>Sequence</th>
+                    <th>PowerStatus</th>
+                    <th>PcsStatus</th>
+                    <th>AcbStatus</th>
+                    <th>Soc</th>
+                    <th>kWh</th>
+                    <th>PCSPower</th>
+                    <th>Sitepower</th>
+                </tr>
+            </thead>
+            <tbody>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+@section Scripts {
+    <script src="~/lib/microsoft/signalr/dist/browser/signalr.js"></script>
+    <script src="~/js/site.js"></script>
+}

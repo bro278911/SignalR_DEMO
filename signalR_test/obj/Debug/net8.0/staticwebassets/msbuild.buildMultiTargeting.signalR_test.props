@@ -1,0 +1,3 @@
+﻿<Project>
+  <Import Project="..\build\signalR_test.props" />
+</Project>
