@@ -1,38 +1,35 @@
-"use strict";
+// 添加調試信息
+function addDebugMessage(message) {
+    const debugDiv = document.getElementById("debugInfo");
+    if (debugDiv) {
+        const messageDiv = document.createElement("div");
+        messageDiv.textContent = `${new Date().toLocaleTimeString()}: ${message}`;
+        debugDiv.insertBefore(messageDiv, debugDiv.firstChild);
 
-document.addEventListener("DOMContentLoaded", function () {
-    var connection = new signalR.HubConnectionBuilder()
-        .withUrl("/chatHub")
-        .withAutomaticReconnect()
-        .build();
-
-    connection.on("ReceiveMessage", function (message) {
-        var li = document.createElement("li");
-        li.textContent = message;
-        document.getElementById("messagesList").appendChild(li);
-    });
-
-    connection.on("ReceiveDatabaseUpdate", function (data) {
-        console.log("收到資料庫更新:", data);
-        var table = document.getElementById("dataTable");
-        if (!table) return;
-
-        // 清空表格內容（保留表頭）
-        while (table.rows.length > 1) {
-            table.deleteRow(1);
+        // 保持最新的 100 條消息
+        while (debugDiv.children.length > 100) {
+            debugDiv.removeChild(debugDiv.lastChild);
         }
+    }
+}
 
-        // 添加新數據
-        data.forEach(function (item) {
-            var row = table.insertRow();
-            Object.values(item).forEach(function (value) {
-                var cell = row.insertCell();
-                cell.textContent = value;
-            });
-        });
+// 格式化日期時間
+function formatDateTime(dateString) {
+    const date = new Date(dateString);
+    return date.toLocaleString('zh-TW', {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
     });
+}
 
-    connection.start().catch(function (err) {
-        return console.error(err.toString());
-    });
-});
+// 高亮顯示行
+function highlightRow(row) {
+    row.style.backgroundColor = '#ffd700';
+    setTimeout(() => {
+        row.style.backgroundColor = '';
+    }, 2000);
+}

@@ -66,10 +66,11 @@ C:\Users\User\source\repos\signalR_test\signalR_test\obj\Debug\net8.0\staticweba
 C:\Users\User\source\repos\signalR_test\signalR_test\obj\Debug\net8.0\staticwebassets\msbuild.buildMultiTargeting.signalR_test.props
 C:\Users\User\source\repos\signalR_test\signalR_test\obj\Debug\net8.0\staticwebassets\msbuild.buildTransitive.signalR_test.props
 C:\Users\User\source\repos\signalR_test\signalR_test\obj\Debug\net8.0\staticwebassets.pack.json
-C:\Users\User\source\repos\signalR_test\signalR_test\obj\Debug\net8.0\staticwebassets.upToDateCheck.txt
 C:\Users\User\source\repos\signalR_test\signalR_test\obj\Debug\net8.0\signalR_.540464C0.Up2Date
 C:\Users\User\source\repos\signalR_test\signalR_test\obj\Debug\net8.0\signalR_test.dll
 C:\Users\User\source\repos\signalR_test\signalR_test\obj\Debug\net8.0\refint\signalR_test.dll
 C:\Users\User\source\repos\signalR_test\signalR_test\obj\Debug\net8.0\signalR_test.pdb
 C:\Users\User\source\repos\signalR_test\signalR_test\obj\Debug\net8.0\signalR_test.genruntimeconfig.cache
 C:\Users\User\source\repos\signalR_test\signalR_test\obj\Debug\net8.0\ref\signalR_test.dll
+C:\Users\User\source\repos\signalR_test\signalR_test\obj\Debug\net8.0\signalR_test.sourcelink.json
+C:\Users\User\source\repos\signalR_test\signalR_test\obj\Debug\net8.0\staticwebassets.upToDateCheck.txt

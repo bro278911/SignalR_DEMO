@@ -13,10 +13,6 @@
       "PackagePath": "staticwebassets\\favicon.ico"
     },
     {
-      "Id": "C:\\Users\\User\\source\\repos\\signalR_test\\signalR_test\\wwwroot\\js\\signalr.js",
-      "PackagePath": "staticwebassets\\js\\signalr.js"
-    },
-    {
       "Id": "C:\\Users\\User\\source\\repos\\signalR_test\\signalR_test\\wwwroot\\js\\site.js",
       "PackagePath": "staticwebassets\\js\\site.js"
     },

@@ -8,63 +8,77 @@ namespace signalR_test.Hubs
     {
         private readonly IConfiguration _configuration;
         private readonly string _connectionString;
-        private SqlDependency _dependency;
-        private SqlConnection _connection;
         private readonly ILogger<ChatHub> _logger;
-        private bool _isMonitoring = false;
+        private readonly IHubContext<ChatHub> _hubContext;
+        private static SqlDependency _dependency;
+        private static SqlConnection _connection;
+        private static readonly object _lock = new object();
+        private static int _connectedClients = 0;
+        private static bool _isMonitoring = false;
+        private static int _lastKnownChargingId = 0;
 
-        public ChatHub(IConfiguration configuration, ILogger<ChatHub> logger)
+        public ChatHub(IConfiguration configuration, ILogger<ChatHub> logger, IHubContext<ChatHub> hubContext)
         {
             _configuration = configuration;
             _connectionString = _configuration.GetConnectionString("DefaultConnection");
             _logger = logger;
+            _hubContext = hubContext;
         }
 
-        public async Task SendDatabaseUpdate()
+        public override async Task OnConnectedAsync()
         {
             try
             {
-                _logger.LogInformation("開始獲取資料庫更新");
-                using (var connection = new SqlConnection(_connectionString))
+                lock (_lock)
                 {
-                    await connection.OpenAsync();
-                    var query = @"
-                        SELECT TOP 100 *
-                        FROM [Cloud_EMS].[dbo].[ChargingStorage] WITH (NOLOCK)
-                        ORDER BY ChargingID DESC, ReceivedTime DESC";
+                    _connectedClients++;
+                    _logger.LogInformation($"客戶端連接成功: {Context.ConnectionId}, 當前連接數: {_connectedClients}");
 
-                    _logger.LogInformation($"執行查詢: {query}");
-
-                    using (var command = new SqlCommand(query, connection))
+                    // 只在第一個客戶端連接時啟動監控
+                    if (_connectedClients == 1)
                     {
-                        using (var reader = await command.ExecuteReaderAsync())
-                        {
-                            var data = new List<Dictionary<string, object>>();
-                            while (await reader.ReadAsync())
-                            {
-                                var row = new Dictionary<string, object>();
-                                for (int i = 0; i < reader.FieldCount; i++)
-                                {
-                                    var value = reader.GetValue(i);
-                                    row[reader.GetName(i)] = value == DBNull.Value ? null : value;
-                                }
-                                data.Add(row);
-                            }
-                            _logger.LogInformation($"找到 {data.Count} 筆資料");
-                            await Clients.All.SendAsync("ReceiveDatabaseUpdate", data);
-                            _logger.LogInformation("資料已發送到客戶端");
-                        }
+                        _ = StartDatabaseMonitoring();
                     }
                 }
+
+                // 立即發送當前數據給新連接的客戶端
+                await SendDatabaseUpdate();
+                await Clients.Caller.SendAsync("ReceiveMessage", "連接成功，開始接收實時更新");
+                await base.OnConnectedAsync();
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "SendDatabaseUpdate 發生錯誤");
-                await Clients.Caller.SendAsync("ReceiveError", ex.Message);
+                _logger.LogError(ex, $"客戶端連接時發生錯誤: {Context.ConnectionId}");
+                await Clients.Caller.SendAsync("ReceiveError", $"連接錯誤: {ex.Message}");
             }
         }
 
-        public async Task StartDatabaseMonitoring()
+        public override async Task OnDisconnectedAsync(Exception exception)
+        {
+            try
+            {
+                lock (_lock)
+                {
+                    _connectedClients--;
+                    _logger.LogInformation($"客戶端斷開連接: {Context.ConnectionId}, 剩餘連接數: {_connectedClients}");
+
+                    // 如果沒有客戶端連接了，停止監控
+                    if (_connectedClients <= 0)
+                    {
+                        StopMonitoring();
+                        _connectedClients = 0; // 確保不會出現負數
+                    }
+                }
+
+                await base.OnDisconnectedAsync(exception);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, $"處理客戶端斷開連接時發生錯誤: {Context.ConnectionId}");
+            }
+        }
+
+        private async Task StartDatabaseMonitoring()
         {
             if (_isMonitoring)
             {
@@ -72,39 +86,71 @@ namespace signalR_test.Hubs
                 return;
             }
 
+            lock (_lock)
+            {
+                if (_isMonitoring) return;
+                _isMonitoring = true;
+            }
+
             try
             {
                 _logger.LogInformation("開始資料庫監控");
+                
+                // 停止現有的監控
                 StopMonitoring();
 
-                _connection = new SqlConnection(_connectionString);
-                await _connection.OpenAsync();
-                _logger.LogInformation("資料庫連接已開啟");
-
                 // 確保 Service Broker 已啟用
-                using (var command = new SqlCommand("SELECT is_broker_enabled FROM sys.databases WHERE name = 'Cloud_EMS'", _connection))
+                using (var connection = new SqlConnection(_connectionString))
                 {
-                    var isBrokerEnabled = (bool)await command.ExecuteScalarAsync();
-                    if (!isBrokerEnabled)
+                    await connection.OpenAsync();
+                    using (var command = new SqlCommand(@"
+                        -- 確保資料庫設置正確
+                        IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name = 'Cloud_EMS' AND is_broker_enabled = 1)
+                        BEGIN
+                            ALTER DATABASE Cloud_EMS SET ENABLE_BROKER WITH ROLLBACK IMMEDIATE;
+                        END
+                        
+                        IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE name = 'Cloud_EMS' AND is_trustworthy_on = 1)
+                        BEGIN
+                            ALTER DATABASE Cloud_EMS SET TRUSTWORTHY ON;
+                        END
+
+                        -- 確保 Service Broker 服務已啟動
+                        IF NOT EXISTS (SELECT 1 FROM sys.dm_broker_activated_tasks WHERE database_id = DB_ID('Cloud_EMS'))
+                        BEGIN
+                            ALTER DATABASE Cloud_EMS SET NEW_BROKER WITH ROLLBACK IMMEDIATE;
+                        END", connection))
                     {
-                        _logger.LogError("Service Broker 未啟用！");
-                        throw new Exception("Database Service Broker is not enabled!");
+                        await command.ExecuteNonQueryAsync();
+                        _logger.LogInformation("資料庫設置已更新");
+                    }
+
+                    // 獲取當前最大的 ChargingID
+                    using (var command = new SqlCommand(@"
+                        SELECT MAX(ChargingID) 
+                        FROM [Cloud_EMS].[dbo].[ChargingStorage]", connection))
+                    {
+                        var result = await command.ExecuteScalarAsync();
+                        if (result != null && result != DBNull.Value)
+                        {
+                            _lastKnownChargingId = Convert.ToInt32(result);
+                            _logger.LogInformation($"初始化最後已知的 ChargingID: {_lastKnownChargingId}");
+                        }
                     }
                 }
 
+                // 啟動 SQL Dependency
+                SqlDependency.Stop(_connectionString);
                 SqlDependency.Start(_connectionString);
-                _logger.LogInformation("SQL Dependency 已啟動");
-
+                _logger.LogInformation("SQL Dependency 服務已重新啟動");
+                
+                // 設置初始依賴
                 await SetupDependency();
-                _isMonitoring = true;
-
-                await Clients.Caller.SendAsync("ReceiveMessage", "資料庫監控已啟動");
                 _logger.LogInformation("資料庫監控已成功啟動");
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "啟動監控時發生錯誤");
-                await Clients.Caller.SendAsync("ReceiveError", $"啟動監控錯誤: {ex.Message}");
                 _isMonitoring = false;
             }
         }
@@ -114,58 +160,95 @@ namespace signalR_test.Hubs
             try
             {
                 _logger.LogInformation("設置新的依賴");
-                var query = @"
-                    SELECT TOP 100 *
-                    FROM [Cloud_EMS].[dbo].[ChargingStorage] WITH (NOLOCK)
-                    ORDER BY ChargingID DESC, ReceivedTime DESC";
-
-                using (var command = new SqlCommand(query, _connection))
+                
+                // 關閉現有連接
+                if (_connection != null)
                 {
-                    command.CommandTimeout = 60;
-                    command.Notification = null;
-
-                    _logger.LogInformation("創建 SQL Dependency");
-                    _dependency = new SqlDependency(command);
-                    _dependency.OnChange += DependencyOnChange;
-
-                    _logger.LogInformation("執行初始查詢");
-                    using (var reader = await command.ExecuteReaderAsync())
-                    {
-                        var data = new List<Dictionary<string, object>>();
-                        while (await reader.ReadAsync())
-                        {
-                            var row = new Dictionary<string, object>();
-                            for (int i = 0; i < reader.FieldCount; i++)
-                            {
-                                var value = reader.GetValue(i);
-                                row[reader.GetName(i)] = value == DBNull.Value ? null : value;
-                            }
-                            data.Add(row);
-                        }
-                        _logger.LogInformation($"初始資料載入: {data.Count} 筆");
-                        await Clients.All.SendAsync("ReceiveDatabaseUpdate", data);
-                    }
+                    await _connection.CloseAsync();
+                    _connection.Dispose();
                 }
+
+                // 創建新連接
+                _connection = new SqlConnection(_connectionString);
+                await _connection.OpenAsync();
+
+                // 使用更簡單的查詢來監控變更
+                var command = new SqlCommand(@"
+                    SELECT ChargingID 
+                    FROM [Cloud_EMS].[dbo].[ChargingStorage] WITH (NOLOCK)
+                    ORDER BY ChargingID DESC", _connection);
+
+                command.CommandTimeout = 60;
+                command.Notification = null;
+
+                _logger.LogInformation("創建 SQL Dependency");
+                _dependency = new SqlDependency(command);
+                _dependency.OnChange += async (sender, e) => await DependencyOnChange(sender, e);
+
+                _logger.LogInformation("執行查詢以啟動監控");
+                using (var reader = await command.ExecuteReaderAsync())
+                {
+                    // 只需要執行查詢，不需要處理結果
+                    while (await reader.ReadAsync()) { }
+                }
+
+                _logger.LogInformation("SQL Dependency 設置完成");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "SetupDependency 發生錯誤");
-                await Clients.Caller.SendAsync("ReceiveError", $"設置依賴錯誤: {ex.Message}");
+                _logger.LogError(ex, "設置 SQL Dependency 時發生錯誤");
+                throw;
             }
         }
 
-        private void DependencyOnChange(object sender, SqlNotificationEventArgs e)
+        private async Task DependencyOnChange(object sender, SqlNotificationEventArgs e)
         {
             _logger.LogInformation($"收到資料庫變更通知: Type={e.Type}, Info={e.Info}, Source={e.Source}");
 
-            if (e.Type == SqlNotificationType.Change)
+            try
             {
-                _ = SendDatabaseUpdate();
-                _ = SetupDependency();
+                // 檢查是否真的有新數據
+                using (var connection = new SqlConnection(_connectionString))
+                {
+                    await connection.OpenAsync();
+                    using (var command = new SqlCommand(@"
+                        SELECT MAX(ChargingID) 
+                        FROM [Cloud_EMS].[dbo].[ChargingStorage]", connection))
+                    {
+                        var result = await command.ExecuteScalarAsync();
+                        if (result != null && result != DBNull.Value)
+                        {
+                            int currentMaxId = Convert.ToInt32(result);
+                            if (currentMaxId > _lastKnownChargingId)
+                            {
+                                _logger.LogInformation($"檢測到新數據: 當前ID={currentMaxId}, 上次ID={_lastKnownChargingId}");
+                                _lastKnownChargingId = currentMaxId;
+                                
+                                // 只有在確實有新數據時才發送更新
+                                await SendDatabaseUpdateToAll();
+                                _logger.LogInformation("成功發送數據庫更新");
+                            }
+                            else
+                            {
+                                _logger.LogInformation("收到通知但數據未變化，跳過更新");
+                            }
+                        }
+                    }
+                }
+
+                // 重新設置監控
+                if (sender is SqlDependency dependency)
+                {
+                    dependency.OnChange -= async (s, args) => await DependencyOnChange(s, args);
+                }
+                await SetupDependency();
+                _logger.LogInformation("成功重新設置監控");
             }
-            else
+            catch (Exception ex)
             {
-                _logger.LogWarning($"收到非變更通知: {e.Type}");
+                _logger.LogError(ex, "處理 SQL Dependency 變更時發生錯誤");
+                // 嘗試重新設置監控
+                _ = SetupDependency();
             }
         }
 
@@ -173,60 +256,140 @@ namespace signalR_test.Hubs
         {
             try
             {
-                _logger.LogInformation("停止監控");
                 if (_dependency != null)
                 {
-                    _dependency.OnChange -= DependencyOnChange;
-                    _dependency = null;
+                    _dependency.OnChange -= async (s, e) => await DependencyOnChange(s, e);
                 }
 
                 if (_connection != null)
                 {
-                    if (_connection.State == ConnectionState.Open)
-                    {
-                        _connection.Close();
-                    }
+                    _connection.Close();
                     _connection.Dispose();
                     _connection = null;
                 }
 
-                try
-                {
-                    SqlDependency.Stop(_connectionString);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "停止 SQL Dependency 時發生錯誤");
-                }
-
-                _isMonitoring = false;
+                _dependency = null;
+                SqlDependency.Stop(_connectionString);
+                
                 _logger.LogInformation("監控已停止");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "StopMonitoring 發生錯誤");
+                _logger.LogError(ex, "停止監控時發生錯誤");
+            }
+            finally
+            {
+                _isMonitoring = false;
             }
         }
 
-        public override async Task OnConnectedAsync()
+        private async Task SendDatabaseUpdateToAll()
         {
-            _logger.LogInformation($"客戶端連接: {Context.ConnectionId}");
-            await SendDatabaseUpdate();
-            await Clients.All.SendAsync("ReceiveMessage", "新用戶已連接!");
-            await base.OnConnectedAsync();
+            try
+            {
+                using (var connection = new SqlConnection(_connectionString))
+                {
+                    await connection.OpenAsync();
+                    using (var command = new SqlCommand(@"
+                        SELECT TOP 10
+                            ChargingID, SiteID, ReceivedTime, Datatime, 
+                            Sequence, PowerStatus, PcsStatus, AcbStatus,
+                            Soc, kWh, PCSPower, Sitepower
+                        FROM [Cloud_EMS].[dbo].[ChargingStorage]
+                        ORDER BY ChargingID DESC", connection))
+                    {
+                        using var reader = await command.ExecuteReaderAsync();
+                        var data = new List<object>();
+                        while (await reader.ReadAsync())
+                        {
+                            data.Add(new
+                            {
+                                ChargingID = reader.GetInt32(0),
+                                SiteID = reader.GetInt32(1),
+                                ReceivedTime = reader.GetDateTime(2),
+                                Datatime = reader.GetDateTime(3),
+                                Sequence = reader.GetInt32(4),
+                                PowerStatus = reader.GetInt32(5),
+                                PcsStatus = reader.GetInt32(6),
+                                AcbStatus = reader.GetInt32(7),
+                                Soc = reader.GetDecimal(8),
+                                kWh = reader.GetDecimal(9),
+                                PCSPower = reader.GetDecimal(10),
+                                Sitepower = reader.GetDecimal(11)
+                            });
+                        }
+
+                        if (data.Any())
+                        {
+                            await _hubContext.Clients.All.SendAsync("ReceiveDatabaseUpdate", data);
+                            _logger.LogInformation($"成功發送數據庫更新，數據筆數: {data.Count}");
+                        }
+                        else
+                        {
+                            _logger.LogWarning("未找到任何數據");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "發送數據庫更新時發生錯誤");
+            }
         }
 
-        public override async Task OnDisconnectedAsync(Exception exception)
+        public async Task SendDatabaseUpdate()
         {
-            _logger.LogInformation($"客戶端斷開連接: {Context.ConnectionId}");
-            StopMonitoring();
-            await Clients.All.SendAsync("ReceiveMessage", "用戶已斷開連接!");
-            await base.OnDisconnectedAsync(exception);
-        }
+            try
+            {
+                using (var connection = new SqlConnection(_connectionString))
+                {
+                    await connection.OpenAsync();
+                    using (var command = new SqlCommand(@"
+                        SELECT TOP 10
+                            ChargingID, SiteID, ReceivedTime, Datatime, 
+                            Sequence, PowerStatus, PcsStatus, AcbStatus,
+                            Soc, kWh, PCSPower, Sitepower
+                        FROM [Cloud_EMS].[dbo].[ChargingStorage]
+                        ORDER BY ChargingID DESC", connection))
+                    {
+                        using var reader = await command.ExecuteReaderAsync();
+                        var data = new List<object>();
+                        while (await reader.ReadAsync())
+                        {
+                            data.Add(new
+                            {
+                                ChargingID = reader.GetInt32(0),
+                                SiteID = reader.GetInt32(1),
+                                ReceivedTime = reader.GetDateTime(2),
+                                Datatime = reader.GetDateTime(3),
+                                Sequence = reader.GetInt32(4),
+                                PowerStatus = reader.GetInt32(5),
+                                PcsStatus = reader.GetInt32(6),
+                                AcbStatus = reader.GetInt32(7),
+                                Soc = reader.GetDecimal(8),
+                                kWh = reader.GetDecimal(9),
+                                PCSPower = reader.GetDecimal(10),
+                                Sitepower = reader.GetDecimal(11)
+                            });
+                        }
 
-        public async Task SendMessage(string message)
-        {
-            await Clients.All.SendAsync("ReceiveMessage", message);
+                        if (data.Any())
+                        {
+                            await Clients.All.SendAsync("ReceiveDatabaseUpdate", data);
+                            _logger.LogInformation($"成功發送數據庫更新，數據筆數: {data.Count}");
+                        }
+                        else
+                        {
+                            _logger.LogWarning("未找到任何數據");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "發送數據庫更新時發生錯誤");
+                throw;
+            }
         }
     }
 }
